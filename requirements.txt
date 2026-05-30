@@ -1,0 +1,21 @@
+# Dependencias del descargador (Linux / openSUSE Tumbleweed, Python 3.13, uv)
+# Instalar con:  uv pip install -r requirements.txt
+
+yt-dlp>=2025.1.1        # Descargador principal (mantenlo siempre actualizado)
+mutagen>=1.47.0         # Lectura/escritura de metadatos de audio
+pycryptodomex>=3.20.0   # Requerido por yt-dlp para descifrar algunos formatos
+brotli>=1.1.0           # Descompresion brotli (mejora compatibilidad de sitios)
+certifi>=2024.2.2       # Certificados SSL actualizados
+websockets>=12.0        # Soporte para algunos streams en vivo
+
+# FFmpeg NO va aqui: instalalo a nivel de sistema desde Packman para codecs
+# completos:   sudo zypper install ffmpeg
+#
+# Eliminados respecto a la version Windows:
+#   - colorama       (solo necesario en terminal de Windows)
+#   - ffmpeg-python  (wrapper no usado; se invoca FFmpeg via subprocess/yt-dlp)
+#   - tqdm           (yt-dlp ya trae su propia barra de progreso)
+#   - requests       (no se usa directamente en el script)
+
+# Actualizar yt-dlp periodicamente:
+#   uv pip install --upgrade yt-dlp
