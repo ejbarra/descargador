@@ -76,3 +76,4 @@ uv pip install --upgrade yt-dlp
 ## Licencia
 
 MIT
+yolo
