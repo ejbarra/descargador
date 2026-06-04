@@ -15,7 +15,7 @@ Requiere FFmpeg (paquete del repositorio Packman para codecs completos).
 import sys
 import subprocess
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 try:
     import yt_dlp
