@@ -29,9 +29,11 @@ except ImportError:
 # Configuracion y utilidades base
 # ---------------------------------------------------------------------------
 
+
 # Carpeta base XDG. Se respeta XDG_DOWNLOAD_DIR si esta definida.
 def _carpeta_descargas_base() -> Path:
     import os
+
     xdg = os.environ.get("XDG_DOWNLOAD_DIR")
     if xdg:
         return Path(xdg).expanduser()
@@ -79,19 +81,23 @@ def _fmt_duracion(segundos: int | None) -> str:
 # Configuracion de descarga
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class OpcionesAudio:
     """Parametros de extraccion de audio."""
+
     codec: str = "mp3"
     calidad: str = "320"
     caratula: bool = True
 
     def postprocessors(self, ffmpeg: bool) -> list[dict]:
-        pps: list[dict] = [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": self.codec,
-            "preferredquality": self.calidad,
-        }]
+        pps: list[dict] = [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": self.codec,
+                "preferredquality": self.calidad,
+            }
+        ]
         if self.caratula and ffmpeg:
             pps.append({"key": "EmbedThumbnail", "already_have_thumbnail": False})
             pps.append({"key": "FFmpegMetadata", "add_metadata": True})
@@ -132,6 +138,7 @@ def _formato_video(calidad: str) -> str:
 # ---------------------------------------------------------------------------
 # Descargas
 # ---------------------------------------------------------------------------
+
 
 def descargar_video(url: str, carpeta: Path, calidad: str = "best") -> None:
     """Descarga un video individual fusionado a MP4."""
@@ -233,6 +240,7 @@ def descargar_playlist(
 # Informacion
 # ---------------------------------------------------------------------------
 
+
 def _convertir_url_music(url: str) -> str:
     """Convierte una URL de YouTube Music a YouTube normal."""
     if "music.youtube.com" not in url:
@@ -293,6 +301,7 @@ def mostrar_info(url: str) -> dict | None:
 # Parseo de seleccion (ej: "1,3,5-10,15")
 # ---------------------------------------------------------------------------
 
+
 def parsear_seleccion(texto: str, maximo: int) -> list[int]:
     indices: set[int] = set()
     try:
@@ -312,6 +321,7 @@ def parsear_seleccion(texto: str, maximo: int) -> list[int]:
 # ---------------------------------------------------------------------------
 # Entrada interactiva auxiliar
 # ---------------------------------------------------------------------------
+
 
 def _elegir(prompt: str, opciones: dict[str, str], defecto: str) -> str:
     """Muestra un menu corto y devuelve el valor elegido."""
@@ -351,6 +361,7 @@ def _pedir_opciones_audio() -> OpcionesAudio:
 # ---------------------------------------------------------------------------
 # Menu principal
 # ---------------------------------------------------------------------------
+
 
 def menu() -> None:
     print("Descargador unificado de video y audio")

@@ -1,0 +1,8 @@
+{
+  "typeCheckingMode": "standard",
+  "reportArgumentType": "none",
+  "reportAttributeAccessIssue": "none",
+  "reportReturnType": "none",
+  "reportUnknownVariableType": "none",
+  "reportUnknownArgumentType": "none"
+}
