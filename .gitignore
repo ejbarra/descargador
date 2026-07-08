@@ -4,8 +4,10 @@ __pycache__/
 .env
 venv/
 .venv/
-~/Descargas/
 downloads/
 *.mp4
 *.mp3
 *.webm
+errores.txt
+*.ruff_cache
+
