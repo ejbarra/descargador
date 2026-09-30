@@ -1,0 +1,7 @@
+# Dependencias solo para desarrollo (no las gestiona la comprobacion de
+# actualizaciones del programa, que lee unicamente requirements.txt).
+# Instalar con:  uv pip install -r requirements-dev.txt
+
+-r requirements.txt
+pytest>=8.0
+ruff>=0.5

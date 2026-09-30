@@ -11,3 +11,8 @@ downloads/
 errores.txt
 *.ruff_cache
 
+*.opus
+*.m4a
+*.part
+*.ytdl
+.pytest_cache/
