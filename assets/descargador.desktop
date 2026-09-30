@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Descargador
+Comment=Descargador de video y audio (yt-dlp)
+# Ajusta la ruta al clon del repositorio (y al interprete del venv si usas uno).
+Exec=python3 /ruta/a/descargador/Descargador.py %u
+Icon=descargador
+Terminal=false
+Categories=AudioVideo;Network;Qt;
+Keywords=youtube;video;audio;mp3;yt-dlp;descargar;
+StartupNotify=true
+# Debe coincidir con QApplication.setDesktopFileName("descargador") para que
+# Wayland asocie la ventana (app_id) con esta entrada y su icono.
+StartupWMClass=descargador
