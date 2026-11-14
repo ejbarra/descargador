@@ -5,7 +5,9 @@ Descargador de video y audio basado en yt-dlp.
 Soporta:
   - Video individual (con seleccion de calidad, metadatos y miniatura).
   - Audio individual (mp3/opus/m4a, con caratula y metadatos).
-  - Informacion detallada de un video o audio.
+  - Listas de reproduccion completas, en video o en audio (opcional), en una
+    subcarpeta por lista y sin repetir lo ya descargado.
+  - Informacion detallada de un video, un audio o una lista.
 
 Incluye:
   - Interfaz grafica (PySide6 / Qt 6, nativa en Wayland) y, opcionalmente,
@@ -65,7 +67,7 @@ def main() -> int:
                 from descargador.gui import lanzar_gui
             except ImportError as e:
                 log.error("No se pudo cargar la GUI (%s).", e)
-                log.error("Instala PySide6 con: uv pip install -r requirements.txt")
+                log.error("Instale PySide6 con: uv pip install -r requirements.txt")
             else:
                 return lanzar_gui(ruta_req, comprobar=comprobar, url_inicial=args.url)
         log.info("Usando interfaz de texto como alternativa.")
