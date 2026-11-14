@@ -4,6 +4,11 @@ Nucleo del descargador: configuracion, logging, descargas e informacion.
 Este modulo no depende de ninguna interfaz (ni Qt ni consola). Las interfaces
 reciben el progreso mediante un callback y pueden cancelar una descarga en
 curso con un ``threading.Event``.
+
+Las funciones de descarga trabajan sobre un video individual salvo que se pida
+``lista=True``: en ese caso, si la URL corresponde a una lista de reproduccion,
+se descarga la lista completa en una subcarpeta propia (ver la seccion
+"Listas de reproduccion").
 """
 
 from __future__ import annotations
@@ -18,16 +23,21 @@ import subprocess
 import sys
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 try:
     import yt_dlp
-    from yt_dlp.utils import DownloadCancelled, DownloadError, format_bytes
+    from yt_dlp.utils import (
+        DownloadCancelled,
+        DownloadError,
+        format_bytes,
+        sanitize_filename,
+    )
 except ImportError:  # pragma: no cover - solo informa al usuario
     print("[ERROR] yt-dlp no esta instalado.")
-    print("        Instalalo con: uv pip install -r requirements.txt")
+    print("        Instalelo con: uv pip install -r requirements.txt")
     sys.exit(1)
 
 
@@ -266,7 +276,7 @@ def comprobar_actualizaciones(
         return
 
     if up.returncode == 0:
-        log.info("Paquetes actualizados. Reinicia el programa para usarlos.")
+        log.info("Paquetes actualizados. Reinicie el programa para usarlos.")
     else:
         log.warning("Fallo la actualizacion: %s", up.stderr.strip())
 
@@ -343,6 +353,10 @@ class Progreso:
     fase: str  # "descarga" | "postproceso" | "finalizado"
     porcentaje: float | None  # 0-100, o None si es indeterminado
     texto: str  # descripcion legible
+    # Solo en modo lista: posicion del elemento en curso y total de la lista.
+    # El porcentaje sigue siendo el del archivo en curso.
+    elemento: int | None = None
+    total: int | None = None
 
 
 ProgresoCallback = Callable[[Progreso], None]
@@ -362,26 +376,65 @@ _NOMBRES_PP = {
 
 
 class _Seguimiento:
-    """Hooks de yt-dlp: reenvia el progreso y aplica la cancelacion."""
+    """
+    Hooks de yt-dlp: reenvia el progreso y aplica la cancelacion.
+
+    Con ``en_lista=True`` el texto de progreso se antepone con la posicion del
+    elemento en curso ("Video 3 de 25 - ...") y se acumulan en ``rutas`` los
+    archivos terminados de la lista.
+    """
 
     def __init__(
-        self, progreso: ProgresoCallback | None, cancelar: threading.Event | None
+        self,
+        progreso: ProgresoCallback | None,
+        cancelar: threading.Event | None,
+        en_lista: bool = False,
     ) -> None:
         self._progreso = progreso
         self._cancelar = cancelar
+        self._en_lista = en_lista
         self.ruta_final: Path | None = None
+        self.rutas: list[Path] = []
         self._temporales: set[str] = set()
         self._ultimo_pp: str | None = None
 
     # -- utilidades --------------------------------------------------------
 
-    def _emitir(self, fase: str, pct: float | None, texto: str) -> None:
-        if self._progreso is not None:
-            self._progreso(Progreso(fase, pct, texto))
+    def _posicion(self, d: dict) -> tuple[int | None, int | None]:
+        """Posicion del elemento y total de la lista segun el info_dict del hook."""
+        if not self._en_lista:
+            return None, None
+        info = d.get("info_dict") or {}
+        indice = info.get("playlist_index")
+        total = info.get("n_entries") or info.get("playlist_count")
+        return (
+            indice if isinstance(indice, int) else None,
+            total if isinstance(total, int) else None,
+        )
+
+    def _emitir(
+        self, fase: str, pct: float | None, texto: str, d: dict | None = None
+    ) -> None:
+        if self._progreso is None:
+            return
+        elemento, total = self._posicion(d or {})
+        if elemento is not None:
+            prefijo = f"Video {elemento} de {total}" if total else f"Video {elemento}"
+            texto = f"{prefijo} - {texto}"
+        self._progreso(Progreso(fase, pct, texto, elemento, total))
 
     def comprobar_cancelacion(self) -> None:
         if self._cancelar is not None and self._cancelar.is_set():
             raise DownloadCancelled("Cancelado por el usuario")
+
+    def filtro_cancelacion(self, _info: dict, *, incomplete: bool = False) -> None:
+        """
+        ``match_filter`` de yt-dlp: se evalua antes de cada elemento de la lista.
+
+        Permite cancelar entre un video y el siguiente (durante la extraccion no
+        hay hooks de progreso). Devolver None significa "descargar".
+        """
+        self.comprobar_cancelacion()
 
     def limpiar_temporales(self) -> None:
         """Borra los .part (y su .ytdl de reanudacion) que dejo una cancelacion."""
@@ -404,6 +457,8 @@ class _Seguimiento:
             tmp = d.get("tmpfilename")
             if tmp:
                 self._temporales.add(tmp)
+            # Un archivo nuevo reinicia la deduplicacion de postprocesadores.
+            self._ultimo_pp = None
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             hechos = d.get("downloaded_bytes") or 0
             pct = hechos / total * 100 if total else None
@@ -416,11 +471,11 @@ class _Seguimiento:
             eta = d.get("eta")
             if eta:
                 partes.append(f"(quedan {fmt_duracion(eta)})")
-            self._emitir("descarga", pct, "Descargando " + " ".join(partes))
+            self._emitir("descarga", pct, "Descargando " + " ".join(partes), d)
         elif estado == "finished":
-            self._emitir("descarga", 100.0, "Descarga completada, procesando...")
+            self._emitir("descarga", 100.0, "Descarga completada, procesando...", d)
         elif estado == "error":
-            self._emitir("descarga", None, "Error en la descarga")
+            self._emitir("descarga", None, "Error en la descarga", d)
 
     def hook_postproceso(self, d: dict) -> None:
         # yt-dlp notifica cada postprocesador dos veces; solo emitimos la primera.
@@ -430,10 +485,12 @@ class _Seguimiento:
         self._ultimo_pp = nombre
         texto = _NOMBRES_PP.get(nombre)
         if texto:
-            self._emitir("postproceso", None, texto)
+            self._emitir("postproceso", None, texto, d)
 
     def post_hook(self, ruta: str) -> None:
+        # yt-dlp lo llama una vez por video, tras terminar todo el postproceso.
         self.ruta_final = Path(ruta)
+        self.rutas.append(self.ruta_final)
 
 
 def _opciones_comunes(seg: _Seguimiento) -> dict:
@@ -452,6 +509,437 @@ def _opciones_comunes(seg: _Seguimiento) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Listas de reproduccion
+# ---------------------------------------------------------------------------
+
+# Archivo oculto que identifica la subcarpeta de una lista (id, titulo, URL).
+ARCHIVO_LISTA = ".descargador_lista.json"
+
+# Registro de descargas (``download_archive`` de yt-dlp) por modo. Son archivos
+# separados para que bajar la lista en audio no omita los videos, ni al reves.
+ARCHIVOS_REGISTRO = {
+    "video": ".descargas_video.txt",
+    "audio": ".descargas_audio.txt",
+}
+
+# Nombre de cada archivo de la lista: la posicion conserva el orden original.
+PLANTILLA_LISTA = "%(playlist_index)03d - %(title)s.%(ext)s"
+
+# Pausa aleatoria (segundos) antes de cada descarga de la lista, para reducir
+# los errores 429 (demasiadas solicitudes) de YouTube.
+PAUSA_LISTA = (1, 3)
+
+MENSAJE_VIDEO_INDIVIDUAL = (
+    "La URL corresponde a un solo video, no a una lista; "
+    "se descargara de forma individual."
+)
+
+
+@dataclass(frozen=True)
+class EntradaLista:
+    """Un elemento de la lista tal como lo devuelve la extraccion ligera."""
+
+    posicion: int  # 1-based, coincide con %(playlist_index)s
+    id: str | None
+    titulo: str | None
+
+    def descripcion(self) -> str:
+        return f"{self.posicion} - {self.titulo or self.id or 'Sin titulo'}"
+
+
+@dataclass
+class InfoLista:
+    """Datos de una lista obtenidos con extract_flat (sin descargar)."""
+
+    id: str
+    titulo: str
+    url: str
+    autor: str | None = None
+    entradas: list[EntradaLista] = field(default_factory=list)
+
+    @property
+    def total(self) -> int:
+        return len(self.entradas)
+
+
+@dataclass
+class ResultadoLista:
+    """Resultado de descargar una lista completa."""
+
+    carpeta: Path  # subcarpeta de la lista
+    titulo: str
+    total: int  # elementos de la lista
+    rutas: list[Path] = field(default_factory=list)  # archivos terminados ahora
+    descargados: int = 0  # descargados en esta ejecucion
+    omitidos: int = 0  # ya presentes en el registro antes de empezar
+    fallidos: list[EntradaLista] = field(default_factory=list)
+    cancelado: bool = False
+
+    @property
+    def disponibles(self) -> int:
+        """Elementos que quedan en la carpeta: los nuevos mas los ya descargados."""
+        return self.descargados + self.omitidos
+
+
+def extraer_ligero(url: str) -> dict | None:
+    """
+    Extraccion rapida que no resuelve los elementos de una lista.
+
+    Con ``extract_flat="in_playlist"`` una lista devuelve ``_type="playlist"``
+    y sus entradas sin procesar (id, titulo, URL); un video individual se
+    extrae de forma normal.
+    """
+    opciones = {
+        "quiet": True,
+        "no_warnings": False,
+        "noplaylist": False,
+        "extract_flat": "in_playlist",
+        "logger": _YtdlpLogger(),
+    }
+    try:
+        with yt_dlp.YoutubeDL(opciones) as ydl:
+            log.info("Comprobando si la URL corresponde a una lista...")
+            return ydl.extract_info(url, download=False)
+    except Exception as e:
+        log.error("No se pudo obtener informacion: %s", e)
+        return None
+
+
+def es_lista(info: dict | None) -> bool:
+    """True si el resultado de la extraccion ligera es una lista."""
+    return bool(info) and info.get("_type") in ("playlist", "multi_video")
+
+
+def leer_info_lista(info: dict, url: str = "") -> InfoLista:
+    """Convierte el resultado de la extraccion ligera en un InfoLista."""
+    entradas = [
+        EntradaLista(
+            posicion=posicion,
+            id=e.get("id"),
+            titulo=e.get("title"),
+        )
+        # La posicion cuenta tambien las entradas vacias, igual que yt-dlp.
+        for posicion, e in enumerate(info.get("entries") or [], 1)
+        if e
+    ]
+    id_lista = str(info.get("id") or info.get("playlist_id") or url)
+    return InfoLista(
+        id=id_lista,
+        titulo=str(info.get("title") or info.get("playlist_title") or id_lista),
+        url=str(info.get("webpage_url") or info.get("original_url") or url),
+        autor=info.get("uploader") or info.get("channel") or None,
+        entradas=entradas,
+    )
+
+
+def nombre_carpeta_lista(titulo: str, id_lista: str = "") -> str:
+    """
+    Nombre de carpeta seguro para la lista.
+
+    Usa ``sanitize_filename`` de yt-dlp y ademas quita espacios y puntos
+    iniciales, para que la carpeta no quede oculta ni con nombre vacio.
+    """
+    for candidato in (titulo, id_lista):
+        nombre = sanitize_filename(candidato or "").strip().lstrip(".").strip()
+        if nombre:
+            return nombre
+    return "lista"
+
+
+def leer_json_lista(carpeta: Path) -> dict | None:
+    """Lee el .descargador_lista.json de una carpeta; None si falta o no es valido."""
+    try:
+        datos = json.loads((carpeta / ARCHIVO_LISTA).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return datos if isinstance(datos, dict) else None
+
+
+def resolver_carpeta_lista(destino: Path, lista: InfoLista) -> Path:
+    """
+    Carpeta donde se guarda la lista. No crea nada; solo decide la ruta.
+
+    Orden de busqueda:
+      1. El propio destino, si su .descargador_lista.json tiene el mismo id
+         (el usuario eligio la subcarpeta de la lista, quiza ya movida).
+      2. Una subcarpeta directa del destino con ese mismo id (sirve aunque se
+         haya renombrado o el autor haya cambiado el titulo de la lista).
+      3. Una subcarpeta nueva con el titulo saneado de la lista. Si ya existe
+         una carpeta con ese nombre que pertenece a otra lista, se agrega el id
+         al nombre para no mezclarlas.
+    """
+
+    def es_de_la_lista(carpeta: Path) -> bool:
+        datos = leer_json_lista(carpeta)
+        return datos is not None and datos.get("id") == lista.id
+
+    if es_de_la_lista(destino):
+        return destino
+    try:
+        subcarpetas = sorted(p for p in destino.iterdir() if p.is_dir())
+    except OSError:
+        subcarpetas = []
+    for sub in subcarpetas:
+        if es_de_la_lista(sub):
+            return sub
+
+    nombre = nombre_carpeta_lista(lista.titulo, lista.id)
+    candidata = destino / nombre
+    if leer_json_lista(candidata) is not None:  # existe y es de otra lista
+        candidata = destino / f"{nombre} [{nombre_carpeta_lista(lista.id)}]"
+    return candidata
+
+
+def preparar_carpeta_lista(carpeta: Path, lista: InfoLista) -> None:
+    """Crea la carpeta de la lista y escribe (o actualiza) su .json."""
+    carpeta.mkdir(parents=True, exist_ok=True)
+    datos = {"id": lista.id, "titulo": lista.titulo, "url": lista.url}
+    (carpeta / ARCHIVO_LISTA).write_text(
+        json.dumps(datos, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def archivo_registro(carpeta: Path, modo: str) -> Path:
+    """Registro de descargas de la lista para el modo dado ("video" o "audio")."""
+    try:
+        return carpeta / ARCHIVOS_REGISTRO[modo]
+    except KeyError:
+        raise ValueError(f"Modo no valido para el registro: {modo!r}") from None
+
+
+def leer_registro(ruta: Path) -> set[str] | None:
+    """
+    Ids de video presentes en un registro de yt-dlp ("<extractor> <id>").
+
+    Devuelve un conjunto vacio si el archivo aun no existe y None si no se
+    pudo leer.
+    """
+    if not ruta.exists():
+        return set()
+    try:
+        texto = ruta.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    ids: set[str] = set()
+    for linea in texto.splitlines():
+        partes = linea.strip().split(None, 1)
+        if len(partes) == 2:
+            ids.add(partes[1].strip())
+    return ids
+
+
+def resumir_lista(
+    entradas: list[EntradaLista],
+    antes: set[str] | None,
+    despues: set[str] | None,
+) -> tuple[list[EntradaLista], list[EntradaLista], list[EntradaLista]]:
+    """
+    Clasifica las entradas comparando el registro antes y despues de descargar.
+
+    Devuelve (descargadas, omitidas, fallidas). yt-dlp solo anota en el
+    registro los videos terminados con exito, de modo que lo que no estaba
+    antes ni esta despues no se pudo descargar (borrado, privado, bloqueado o
+    con error). Si el registro posterior no se pudo leer, no se puede saber
+    que fallo y ``descargadas`` y ``fallidas`` quedan vacias.
+    """
+    previas = antes or set()
+    omitidas = [e for e in entradas if e.id in previas]
+    if despues is None:
+        return [], omitidas, []
+    pendientes = [e for e in entradas if e.id not in previas]
+    descargadas = [e for e in pendientes if e.id in despues]
+    fallidas = [e for e in pendientes if e.id not in despues]
+    return descargadas, omitidas, fallidas
+
+
+def _escapar_plantilla(texto: str) -> str:
+    """Escapa '%' para que una ruta literal no se interprete como plantilla."""
+    return texto.replace("%", "%%")
+
+
+def con_alternativa(formato: str) -> str:
+    """
+    Agrega "/best" al final del selector si no lo tiene.
+
+    En modo lista la alternativa va dentro de la propia cadena de formato para
+    que yt-dlp la resuelva video por video (un reintento externo volveria a
+    descargar la lista completa).
+    """
+    return formato if formato.split("/")[-1] == "best" else f"{formato}/best"
+
+
+def _opciones_lista(seg: _Seguimiento, carpeta: Path, registro: Path) -> dict:
+    """Opciones que se agregan a las comunes al descargar una lista."""
+    ruta = _escapar_plantilla(str(carpeta.resolve()))
+    return {
+        "noplaylist": False,
+        # Un video borrado, privado o bloqueado no detiene la lista.
+        "ignoreerrors": "only_download",
+        "outtmpl": os.path.join(ruta, PLANTILLA_LISTA),
+        "download_archive": str(registro.resolve()),
+        "sleep_interval": PAUSA_LISTA[0],
+        "max_sleep_interval": PAUSA_LISTA[1],
+        # Evita la miniatura/descripcion de la propia lista (writethumbnail
+        # tambien se aplicaria a la lista y dejaria una imagen suelta).
+        "allow_playlist_files": False,
+        "match_filter": seg.filtro_cancelacion,
+    }
+
+
+def opciones_video(
+    seg: _Seguimiento,
+    carpeta: Path,
+    video: OpcionesVideo,
+    ffmpeg: bool,
+    registro: Path | None = None,
+) -> dict:
+    """
+    Opciones de yt-dlp para descargar video.
+
+    Sin ``registro`` se arma la descarga individual (comportamiento de
+    siempre); con ``registro`` se arma la descarga de una lista en ``carpeta``.
+    """
+    opciones = _opciones_comunes(seg) | {
+        "format": formato_video(video.calidad) if ffmpeg else "best",
+        "outtmpl": str(carpeta / "%(title)s.%(ext)s"),
+        "merge_output_format": "mp4",
+        "postprocessors": video.postprocessors(ffmpeg),
+        "writethumbnail": bool(video.metadatos and ffmpeg),
+    }
+    if registro is not None:
+        opciones |= _opciones_lista(seg, carpeta, registro)
+        opciones["format"] = con_alternativa(opciones["format"])
+    return opciones
+
+
+def opciones_audio(
+    seg: _Seguimiento,
+    carpeta: Path,
+    audio: OpcionesAudio,
+    ffmpeg: bool,
+    registro: Path | None = None,
+) -> dict:
+    """Opciones de yt-dlp para extraer audio (individual o, con ``registro``, lista)."""
+    opciones = _opciones_comunes(seg) | {
+        "format": "bestaudio/best",
+        "outtmpl": str(carpeta / "%(title)s.%(ext)s"),
+    }
+    if ffmpeg:
+        opciones["postprocessors"] = audio.postprocessors(ffmpeg)
+        opciones["writethumbnail"] = audio.caratula
+    if registro is not None:
+        opciones |= _opciones_lista(seg, carpeta, registro)
+        opciones["format"] = con_alternativa(opciones["format"])
+    return opciones
+
+
+ConstructorOpciones = Callable[[_Seguimiento, Path, Path], dict]
+
+
+def _detectar_lista(url: str) -> dict | None:
+    """
+    Extraccion ligera para decidir entre lista y video individual.
+
+    Devuelve el resultado si es una lista; None si es un video individual o si
+    no se pudo determinar (en ambos casos se sigue con la descarga individual).
+    """
+    info = extraer_ligero(url)
+    if info is None:
+        log.warning(
+            "No se pudo determinar si la URL es una lista; "
+            "se intentara la descarga individual."
+        )
+        return None
+    if es_lista(info):
+        return info
+    log.info(MENSAJE_VIDEO_INDIVIDUAL)
+    return None
+
+
+def _descargar_lista(
+    url: str,
+    info: dict,
+    destino: Path,
+    modo: str,
+    construir: ConstructorOpciones,
+    progreso: ProgresoCallback | None,
+    cancelar: threading.Event | None,
+) -> ResultadoLista | None:
+    """Descarga todos los elementos de una lista ya detectada."""
+    lista = leer_info_lista(info, url)
+    carpeta = resolver_carpeta_lista(destino, lista)
+    try:
+        preparar_carpeta_lista(carpeta, lista)
+    except OSError as e:
+        log.error("No se pudo preparar la carpeta de la lista: %s", e)
+        return None
+
+    registro = archivo_registro(carpeta, modo)
+    antes = leer_registro(registro)
+    log.info("Lista: %s (%d videos)", lista.titulo, lista.total)
+    log.info("Carpeta de la lista: %s", carpeta)
+    if antes is None:
+        log.warning(
+            "No se pudo leer el registro %s; no se sabe que videos ya estan "
+            "descargados.",
+            registro,
+        )
+    else:
+        ya = sum(1 for e in lista.entradas if e.id in antes)
+        log.info(
+            "Se omitiran %d de %d videos por estar ya descargados (registro %s).",
+            ya,
+            lista.total,
+            registro.name,
+        )
+
+    seg = _Seguimiento(progreso, cancelar, en_lista=True)
+    resultado = ResultadoLista(carpeta=carpeta, titulo=lista.titulo, total=lista.total)
+    try:
+        with yt_dlp.YoutubeDL(construir(seg, carpeta, registro)) as ydl:
+            seg.comprobar_cancelacion()
+            # Reutiliza la extraccion ligera: yt-dlp resuelve cada entrada al
+            # descargarla, sin volver a pedir la lista.
+            ydl.process_ie_result(info, download=True)
+    except DownloadCancelled:
+        seg.limpiar_temporales()
+        log.info("Descarga de la lista cancelada por el usuario.")
+        resultado.cancelado = True
+    except Exception as e:
+        log.error("No se pudo descargar la lista: %s", e)
+        return None
+
+    despues = leer_registro(registro)
+    descargadas, omitidas, fallidas = resumir_lista(lista.entradas, antes, despues)
+    resultado.rutas = list(seg.rutas)
+    resultado.omitidos = len(omitidas)
+    if despues is None:
+        log.warning("No se pudo leer el registro %s al terminar.", registro)
+        resultado.descargados = len(seg.rutas)
+    else:
+        resultado.descargados = len(descargadas)
+    # Tras una cancelacion lo pendiente no fallo: simplemente no se intento.
+    if not resultado.cancelado:
+        resultado.fallidos = fallidas
+
+    for e in resultado.fallidos:
+        log.warning("No disponible o fallido: %s", e.descripcion())
+    log.info(
+        "Resumen de la lista%s: %d descargados, %d omitidos por el registro, "
+        "%d no disponibles o fallidos (total: %d).",
+        " (cancelada)" if resultado.cancelado else "",
+        resultado.descargados,
+        resultado.omitidos,
+        len(resultado.fallidos),
+        resultado.total,
+    )
+    log.info("Carpeta de la lista: %s", carpeta)
+    if progreso is not None and not resultado.cancelado:
+        progreso(Progreso("finalizado", 100.0, "Completado"))
+    return resultado
+
+
+# ---------------------------------------------------------------------------
 # Descargas
 # ---------------------------------------------------------------------------
 
@@ -462,11 +950,15 @@ def descargar_video(
     video: OpcionesVideo | None = None,
     progreso: ProgresoCallback | None = None,
     cancelar: threading.Event | None = None,
-) -> Path | None:
+    lista: bool = False,
+) -> Path | ResultadoLista | None:
     """
-    Descarga un video individual fusionado a MP4.
+    Descarga un video fusionado a MP4.
 
-    Devuelve la ruta del archivo final, o None si fallo o se cancelo.
+    Por defecto descarga solo el video, aunque la URL traiga ``list=``, y
+    devuelve la ruta del archivo final. Con ``lista=True``, si la URL
+    corresponde a una lista se descarga completa y se devuelve un
+    ResultadoLista. Devuelve None si fallo o se cancelo.
     """
     video = video or OpcionesVideo()
     ffmpeg = verificar_ffmpeg()
@@ -475,14 +967,23 @@ def descargar_video(
             "Sin FFmpeg no se pueden fusionar video y audio; "
             "se descargara el mejor formato ya combinado."
         )
+
+    if lista:
+        info_lista = _detectar_lista(url)
+        if info_lista is not None:
+            log.info("Descargando en calidad: %s", video.calidad)
+            return _descargar_lista(
+                url,
+                info_lista,
+                carpeta,
+                "video",
+                lambda s, c, r: opciones_video(s, c, video, ffmpeg, r),
+                progreso,
+                cancelar,
+            )
+
     seg = _Seguimiento(progreso, cancelar)
-    opciones = _opciones_comunes(seg) | {
-        "format": formato_video(video.calidad) if ffmpeg else "best",
-        "outtmpl": str(carpeta / "%(title)s.%(ext)s"),
-        "merge_output_format": "mp4",
-        "postprocessors": video.postprocessors(ffmpeg),
-        "writethumbnail": bool(video.metadatos and ffmpeg),
-    }
+    opciones = opciones_video(seg, carpeta, video, ffmpeg)
 
     try:
         with yt_dlp.YoutubeDL(opciones) as ydl:
@@ -528,11 +1029,14 @@ def descargar_audio(
     audio: OpcionesAudio | None = None,
     progreso: ProgresoCallback | None = None,
     cancelar: threading.Event | None = None,
-) -> Path | None:
+    lista: bool = False,
+) -> Path | ResultadoLista | None:
     """
-    Descarga solo el audio de un video individual.
+    Descarga solo el audio.
 
-    Devuelve la ruta del archivo final, o None si fallo o se cancelo.
+    Igual que descargar_video(): individual por defecto (devuelve la ruta del
+    archivo final) y, con ``lista=True`` y una URL de lista, la lista completa
+    (devuelve un ResultadoLista). Devuelve None si fallo o se cancelo.
     """
     audio = audio or OpcionesAudio()
     ffmpeg = verificar_ffmpeg()
@@ -541,19 +1045,27 @@ def descargar_audio(
             "Sin FFmpeg no se puede convertir ni embeber caratula; "
             "se descargara el audio original sin procesar."
         )
+    destino = audio.codec.upper() if ffmpeg else "original"
+
+    if lista:
+        info_lista = _detectar_lista(url)
+        if info_lista is not None:
+            log.info("Descargando audio (%s)...", destino)
+            return _descargar_lista(
+                url,
+                info_lista,
+                carpeta,
+                "audio",
+                lambda s, c, r: opciones_audio(s, c, audio, ffmpeg, r),
+                progreso,
+                cancelar,
+            )
 
     seg = _Seguimiento(progreso, cancelar)
-    opciones = _opciones_comunes(seg) | {
-        "format": "bestaudio/best",
-        "outtmpl": str(carpeta / "%(title)s.%(ext)s"),
-    }
-    if ffmpeg:
-        opciones["postprocessors"] = audio.postprocessors(ffmpeg)
-        opciones["writethumbnail"] = audio.caratula
+    opciones = opciones_audio(seg, carpeta, audio, ffmpeg)
 
     try:
         with yt_dlp.YoutubeDL(opciones) as ydl:
-            destino = audio.codec.upper() if ffmpeg else "original"
             log.info("Descargando audio (%s)...", destino)
             ydl.download([url])
     except DownloadCancelled:
@@ -578,7 +1090,7 @@ def _informar_resultado(seg: _Seguimiento, progreso: ProgresoCallback | None) ->
 
 
 # ---------------------------------------------------------------------------
-# Informacion (distingue video vs audio; sin playlists)
+# Informacion (video, audio o, si se pide, lista)
 # ---------------------------------------------------------------------------
 
 
@@ -648,10 +1160,49 @@ def formatear_info(info: dict) -> str:
     return "\n".join(lineas)
 
 
-def mostrar_info(url: str) -> dict | None:
+def formatear_info_lista(lista: InfoLista) -> str:
+    """Bloque de texto con los datos de una lista y sus titulos numerados."""
+    lineas = [
+        "Tipo:      Lista de reproduccion",
+        f"Titulo:    {lista.titulo}",
+    ]
+    if lista.autor:
+        lineas.append(f"Autor:     {lista.autor}")
+    lineas.append(f"Videos:    {lista.total}")
+    ancho = len(str(lista.entradas[-1].posicion)) if lista.entradas else 1
+    lineas.extend(
+        f"  {e.posicion:>{ancho}}. {e.titulo or e.id or 'Sin titulo'}"
+        for e in lista.entradas
+    )
+    return "\n".join(lineas)
+
+
+def _registrar_bloque(texto: str) -> None:
+    for linea in texto.splitlines():
+        log.info(linea)
+
+
+def mostrar_info(url: str, lista: bool = False) -> dict | None:
+    """
+    Muestra en el registro la informacion de la URL, sin descargar.
+
+    Con ``lista=True`` y una URL de lista se muestran sus datos y la lista
+    numerada de titulos (extraccion ligera); con un video individual se
+    muestra la informacion habitual precedida de un aviso.
+    """
+    if lista:
+        info = extraer_ligero(url)
+        if info is not None:
+            if es_lista(info):
+                _registrar_bloque(formatear_info_lista(leer_info_lista(info, url)))
+            else:
+                log.info(MENSAJE_VIDEO_INDIVIDUAL)
+                _registrar_bloque(formatear_info(info))
+            return info
+        log.warning("Se intentara obtener la informacion como video individual.")
+
     info = obtener_info(url)
     if info is None:
         return None
-    for linea in formatear_info(info).splitlines():
-        log.info(linea)
+    _registrar_bloque(formatear_info(info))
     return info

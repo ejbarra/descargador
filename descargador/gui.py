@@ -58,6 +58,7 @@ from .core import (
     OpcionesAudio,
     OpcionesVideo,
     Progreso,
+    ResultadoLista,
     log,
 )
 
@@ -103,7 +104,7 @@ class Trabajador(QThread):
     """Ejecuta una tarea del nucleo fuera del hilo de la GUI."""
 
     progreso = Signal(object)  # core.Progreso
-    terminado = Signal(object)  # Path | dict | None
+    terminado = Signal(object)  # Path | ResultadoLista | dict | None
 
     def __init__(self, tarea: Tarea, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -151,7 +152,9 @@ class VentanaPrincipal(QMainWindow):
 
         self._ajustes = QSettings()
         self._hilo: Trabajador | None = None
-        self._ultima_ruta: Path | None = None
+        # Carpeta que abre "Abrir carpeta" tras una descarga: la del archivo
+        # individual o la subcarpeta de la lista.
+        self._ultima_carpeta: Path | None = None
         self._modo_actual = "audio"
         self._calidad_mp3 = CALIDADES_MP3[0]
         self._carpetas = {
@@ -222,6 +225,16 @@ class VentanaPrincipal(QMainWindow):
             self._grupo_modo.addButton(rb)
             fila_modo.addWidget(rb)
             rb.toggled.connect(lambda activo, m=modo: activo and self._cambiar_modo(m))
+        fila_modo.addSpacing(24)
+        # Visible en los tres modos: tambien decide si "Informacion" lista los
+        # titulos de una lista o muestra solo el video.
+        self.chk_lista = QCheckBox("Descargar lista completa")
+        self.chk_lista.setToolTip(
+            "Si la URL corresponde a una lista de reproduccion (o a un video con "
+            "list=), se descarga la lista completa en una subcarpeta con su "
+            "titulo.\nSi se desmarca, se descarga solo el video de la URL."
+        )
+        fila_modo.addWidget(self.chk_lista)
         fila_modo.addStretch(1)
         raiz.addWidget(caja_modo)
 
@@ -334,6 +347,7 @@ class VentanaPrincipal(QMainWindow):
             self.restoreGeometry(geom)
         for modo in self._carpetas:
             self._carpetas[modo] = str(a.value(f"carpeta/{modo}", self._carpetas[modo]))
+        self.chk_lista.setChecked(_a_bool(a.value("lista/completa", False)))
         modo = str(a.value("modo", "audio"))
         self._modo_actual = modo if modo in self._radios else "audio"
         self._radios[self._modo_actual].setChecked(True)
@@ -359,6 +373,7 @@ class VentanaPrincipal(QMainWindow):
         for modo, carpeta in self._carpetas.items():
             a.setValue(f"carpeta/{modo}", carpeta)
         a.setValue("modo", self._modo_actual)
+        a.setValue("lista/completa", self.chk_lista.isChecked())
         a.setValue("video/calidad", self.cb_calidad.currentText())
         a.setValue("video/metadatos", self.chk_meta_video.isChecked())
         a.setValue("audio/codec", self.cb_codec.currentText())
@@ -438,8 +453,8 @@ class VentanaPrincipal(QMainWindow):
         return Path(texto).expanduser()
 
     def _abrir_carpeta(self) -> None:
-        if self._ultima_ruta is not None and self._ultima_ruta.parent.is_dir():
-            self._abrir_ruta(self._ultima_ruta.parent)
+        if self._ultima_carpeta is not None and self._ultima_carpeta.is_dir():
+            self._abrir_ruta(self._ultima_carpeta)
             return
         carpeta = self._carpeta_destino()
         if carpeta.is_dir():
@@ -458,14 +473,15 @@ class VentanaPrincipal(QMainWindow):
             return
         url = core.normalizar_url(self.ed_url.text())
         if not url:
-            self.lbl_estado.setText("Ingresa una URL.")
+            self.lbl_estado.setText("Ingrese una URL.")
             self._enfocar_url()
             return
         self.ed_url.setText(url)
 
         modo = self._modo_actual
+        lista = self.chk_lista.isChecked()
         if modo == "info":
-            tarea: Tarea = functools.partial(_tarea_info, url)
+            tarea: Tarea = functools.partial(_tarea_info, url, lista)
         else:
             carpeta = self._carpeta_destino()
             try:
@@ -480,20 +496,21 @@ class VentanaPrincipal(QMainWindow):
                     calidad=self.cb_calidad.currentText(),
                     metadatos=self.chk_meta_video.isChecked(),
                 )
-                tarea = functools.partial(_tarea_video, url, carpeta, video)
+                tarea = functools.partial(_tarea_video, url, carpeta, video, lista)
             else:
                 audio = OpcionesAudio(
                     codec=self.cb_codec.currentText(),
                     calidad=self.cb_aq.currentText(),
                     caratula=self.chk_caratula.isChecked(),
                 )
-                tarea = functools.partial(_tarea_audio, url, carpeta, audio)
+                tarea = functools.partial(_tarea_audio, url, carpeta, audio, lista)
 
         self._guardar_ajustes()
-        self._ultima_ruta = None
+        self._ultima_carpeta = None
         self._set_ocupado(True)
         self.barra.setRange(0, 100)
         self.barra.setValue(0)
+        self.barra.setFormat("%p%")
         self.lbl_estado.setText("Trabajando...")
 
         self._hilo = Trabajador(tarea, self)
@@ -517,6 +534,7 @@ class VentanaPrincipal(QMainWindow):
             self.ed_carpeta,
             self.caja_video,
             self.caja_audio,
+            self.chk_lista,
         ):
             w.setEnabled(not ocupado)
         for rb in self._radios.values():
@@ -527,6 +545,16 @@ class VentanaPrincipal(QMainWindow):
 
     @Slot(object)
     def _actualizar_progreso(self, p: Progreso) -> None:
+        # En modo lista la barra muestra el avance del archivo en curso y el
+        # contador "Video N de M" va en el texto de estado y en la propia barra.
+        # Se prefiere al avance global porque los videos omitidos por el
+        # registro, los fallidos y la fusion de video y audio (dos descargas
+        # por video) harian saltar una barra global de forma poco previsible.
+        if p.elemento is not None:
+            total = p.total if p.total else "?"
+            self.barra.setFormat(f"{p.elemento}/{total} - %p%")
+        else:
+            self.barra.setFormat("%p%")
         if p.porcentaje is None:
             self.barra.setRange(0, 0)  # indeterminado
         else:
@@ -544,8 +572,13 @@ class VentanaPrincipal(QMainWindow):
             hilo.deleteLater()
 
         self.barra.setRange(0, 100)
-        if isinstance(resultado, Path):
-            self._ultima_ruta = resultado
+        self.barra.setFormat("%p%")
+        if isinstance(resultado, ResultadoLista):
+            self._ultima_carpeta = resultado.carpeta
+            self.barra.setValue(0 if resultado.cancelado else 100)
+            self.lbl_estado.setText(_texto_resultado_lista(resultado))
+        elif isinstance(resultado, Path):
+            self._ultima_carpeta = resultado.parent
             self.barra.setValue(100)
             self.lbl_estado.setText(f"Completado: {resultado.name}")
         elif isinstance(resultado, dict):
@@ -556,7 +589,7 @@ class VentanaPrincipal(QMainWindow):
             self.lbl_estado.setText("Cancelado.")
         else:
             self.barra.setValue(0)
-            self.lbl_estado.setText("No se pudo completar (revisa el registro).")
+            self.lbl_estado.setText("No se pudo completar (revise el registro).")
         self._set_ocupado(False)
 
     @Slot(int, str)
@@ -597,28 +630,49 @@ class VentanaPrincipal(QMainWindow):
 # evento de cancelacion como ultimos argumentos).
 
 
-def _tarea_info(url: str, _prog: core.ProgresoCallback, _canc: threading.Event):
-    return core.mostrar_info(url)
+def _tarea_info(
+    url: str, lista: bool, _prog: core.ProgresoCallback, _canc: threading.Event
+):
+    return core.mostrar_info(url, lista=lista)
 
 
 def _tarea_video(
     url: str,
     carpeta: Path,
     video: OpcionesVideo,
+    lista: bool,
     prog: core.ProgresoCallback,
     canc: threading.Event,
 ):
-    return core.descargar_video(url, carpeta, video, progreso=prog, cancelar=canc)
+    return core.descargar_video(
+        url, carpeta, video, progreso=prog, cancelar=canc, lista=lista
+    )
 
 
 def _tarea_audio(
     url: str,
     carpeta: Path,
     audio: OpcionesAudio,
+    lista: bool,
     prog: core.ProgresoCallback,
     canc: threading.Event,
 ):
-    return core.descargar_audio(url, carpeta, audio, progreso=prog, cancelar=canc)
+    return core.descargar_audio(
+        url, carpeta, audio, progreso=prog, cancelar=canc, lista=lista
+    )
+
+
+def _texto_resultado_lista(r: ResultadoLista) -> str:
+    """Texto de estado al terminar (o cancelar) la descarga de una lista."""
+    if r.cancelado:
+        return (
+            f"Lista cancelada: {r.disponibles} de {r.total} "
+            "(se conservan los archivos terminados)."
+        )
+    texto = f"Lista completada: {r.disponibles} de {r.total}"
+    if r.fallidos:
+        texto += f" ({len(r.fallidos)} no disponibles o fallidos)"
+    return texto
 
 
 def _a_bool(valor: object) -> bool:

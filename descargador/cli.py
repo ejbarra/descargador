@@ -29,6 +29,14 @@ def _pedir_url() -> str:
     return core.normalizar_url(input("URL: "))
 
 
+def _pedir_lista() -> bool:
+    """Equivalente a la casilla "Descargar lista completa" de la GUI."""
+    respuesta = input(
+        "Descargar la lista completa si la URL corresponde a una lista? (s/N): "
+    )
+    return respuesta.strip().lower() in ("s", "si")
+
+
 def _progreso_consola(p: Progreso) -> None:
     """Muestra el avance en la terminal, sobrescribiendo la linea de descarga."""
     linea = "\r" + p.texto[:78].ljust(78)
@@ -41,7 +49,7 @@ def _pedir_opciones_video() -> OpcionesVideo:
     print("\nCalidad:")
     print("  " + "   ".join(f"{i}. {c}" for i, c in enumerate(CALIDADES_VIDEO, 1)))
     calidad = _elegir(
-        f"Elige calidad (1-{len(CALIDADES_VIDEO)}) [1]: ",
+        f"Elija la calidad (1-{len(CALIDADES_VIDEO)}) [1]: ",
         {str(i): c for i, c in enumerate(CALIDADES_VIDEO, 1)},
         "1",
     )
@@ -55,7 +63,7 @@ def _pedir_opciones_audio() -> OpcionesAudio:
     print("  2. Opus  (mejor relacion calidad/tamano)")
     print("  3. M4A/AAC")
     codec = _elegir(
-        "Elige formato (1-3) [1]: ",
+        "Elija el formato (1-3) [1]: ",
         {"1": "mp3", "2": "opus", "3": "m4a"},
         "1",
     )
@@ -67,7 +75,7 @@ def _pedir_opciones_audio() -> OpcionesAudio:
             "  " + "   ".join(f"{i}. {c} kbps" for i, c in enumerate(CALIDADES_MP3, 1))
         )
         calidad = _elegir(
-            f"Elige calidad (1-{len(CALIDADES_MP3)}) [1]: ",
+            f"Elija la calidad (1-{len(CALIDADES_MP3)}) [1]: ",
             {str(i): c for i, c in enumerate(CALIDADES_MP3, 1)},
             "1",
         )
@@ -99,33 +107,39 @@ def menu() -> None:
         print("\nOpciones:")
         print("  1. Descargar video")
         print("  2. Descargar audio")
-        print("  3. Ver informacion (video o audio)")
+        print("  3. Ver informacion (video, audio o lista)")
         print("  4. Salir")
 
-        opcion = input("\nElige una opcion (1-4): ").strip()
+        opcion = input("\nElija una opcion (1-4): ").strip()
 
         if opcion == "1":
             url = _pedir_url()
             if not url:
                 continue
+            lista = _pedir_lista()
             video = _pedir_opciones_video()
             defecto = SUBCARPETAS["video"]
             carpeta = core.resolver_carpeta(input(f"Subcarpeta [{defecto}]: "), defecto)
-            core.descargar_video(url, carpeta, video, progreso=_progreso_consola)
+            core.descargar_video(
+                url, carpeta, video, progreso=_progreso_consola, lista=lista
+            )
 
         elif opcion == "2":
             url = _pedir_url()
             if not url:
                 continue
+            lista = _pedir_lista()
             audio = _pedir_opciones_audio()
             defecto = SUBCARPETAS["audio"]
             carpeta = core.resolver_carpeta(input(f"Subcarpeta [{defecto}]: "), defecto)
-            core.descargar_audio(url, carpeta, audio, progreso=_progreso_consola)
+            core.descargar_audio(
+                url, carpeta, audio, progreso=_progreso_consola, lista=lista
+            )
 
         elif opcion == "3":
             url = _pedir_url()
             if url:
-                core.mostrar_info(url)
+                core.mostrar_info(url, lista=_pedir_lista())
 
         elif opcion == "4":
             print("Hasta luego.")
